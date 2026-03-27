@@ -6,8 +6,21 @@ import {
   checkGuess,
 } from './WordBank';
 import type { WordEntry } from './WordBank';
+import {
+  getRandomWords,
+  generateHintProgressive,
+  getNextRevealIndex,
+  checkGuess,
+} from './WordBank';
+import type { WordEntry } from './WordBank';
 import { Server } from 'socket.io';
 
+export type RoomState =
+  | 'waiting'
+  | 'choosing'
+  | 'drawing'
+  | 'roundEnd'
+  | 'gameEnd';
 export type RoomState =
   | 'waiting'
   | 'choosing'
@@ -57,6 +70,8 @@ export class Room {
   currentWord: string = '';
   currentCategory: string = '';
   wordChoices: WordEntry[] = [];
+  currentCategory: string = '';
+  wordChoices: WordEntry[] = [];
   hint: string = '';
   revealedIndices: number[] = [];
   drawActions: DrawAction[] = [];
@@ -64,6 +79,10 @@ export class Room {
   timeLeft: number = 0;
   guessedCount: number = 0;
   playerOrder: string[] = [];
+
+  // Deferred scoring: accumulate during round, apply at end
+  private pendingScores: Map<string, number> = new Map();
+  private pendingDrawerScore: number = 0;
 
   // Deferred scoring: accumulate during round, apply at end
   private pendingScores: Map<string, number> = new Map();
@@ -82,13 +101,17 @@ export class Room {
 
   // ─── Player Management ────────────────────────────────────────
 
+  // ─── Player Management ────────────────────────────────────────
+
   addPlayer(socketId: string, name: string): Player | null {
     if (this.players.size >= this.settings.maxPlayers) return null;
     if (this.players.has(socketId)) return this.players.get(socketId)!;
 
+
     const isHost = this.players.size === 0;
     const player = createPlayer(socketId, name, isHost);
     this.players.set(socketId, player);
+
 
     this.addSystemMessage(`${player.name} присоединился к игре`);
     this.broadcastState();
@@ -99,16 +122,30 @@ export class Room {
     const player = this.players.get(socketId);
     if (!player) return;
 
+
     this.players.delete(socketId);
     this.playerOrder = this.playerOrder.filter((id) => id !== socketId);
     this.pendingScores.delete(socketId);
+    this.pendingScores.delete(socketId);
     this.addSystemMessage(`${player.name} покинул игру`);
+
 
     if (player.isHost && this.players.size > 0) {
       const newHost = this.players.values().next().value!;
       newHost.isHost = true;
       this.addSystemMessage(`${newHost.name} теперь хост`);
     }
+
+    if (player.isDrawing && this.state === 'drawing') {
+      this.endRound();
+      return;
+    }
+
+    if (this.players.size < 2 && this.state !== 'waiting') {
+      this.stopGame();
+      return;
+    }
+
 
     if (player.isDrawing && this.state === 'drawing') {
       this.endRound();
@@ -127,12 +164,14 @@ export class Room {
     const player = this.players.get(oldSocketId);
     if (!player) return false;
 
+
     this.players.delete(oldSocketId);
     player.socketId = socketId;
     player.id = socketId;
     player.connected = true;
     this.players.set(socketId, player);
 
+    // Transfer pending score
     const pending = this.pendingScores.get(oldSocketId);
     if (pending !== undefined) {
       this.pendingScores.delete(oldSocketId);
@@ -142,8 +181,11 @@ export class Room {
     const idx = this.playerOrder.indexOf(oldSocketId);
     if (idx >= 0) this.playerOrder[idx] = socketId;
 
+
     return true;
   }
+
+  // ─── Game Flow ────────────────────────────────────────────────
 
   // ─── Game Flow ────────────────────────────────────────────────
 
@@ -151,9 +193,15 @@ export class Room {
     if (this.players.size < 2) return;
     if (this.state !== 'waiting') return;
 
+
     this.currentRound = 0;
     this.playerOrder = Array.from(this.players.keys());
     this.currentDrawerIndex = -1;
+
+    this.players.forEach((p) => {
+      p.score = 0;
+    });
+
 
     this.players.forEach((p) => {
       p.score = 0;
@@ -169,7 +217,16 @@ export class Room {
     this.guessedCount = 0;
     this.currentWord = '';
     this.currentCategory = '';
+    this.currentCategory = '';
     this.hint = '';
+    this.pendingScores.clear();
+    this.pendingDrawerScore = 0;
+
+    this.players.forEach((p) => {
+      p.hasGuessed = false;
+      p.isDrawing = false;
+    });
+
     this.pendingScores.clear();
     this.pendingDrawerScore = 0;
 
@@ -187,10 +244,21 @@ export class Room {
         this.endGame();
         return;
       }
+
+      if (this.currentRound >= this.settings.rounds) {
+        this.endGame();
+        return;
+      }
     }
+
 
     const drawerId = this.playerOrder[this.currentDrawerIndex];
     const drawer = this.players.get(drawerId);
+    if (!drawer) {
+      this.nextTurn();
+      return;
+    }
+
     if (!drawer) {
       this.nextTurn();
       return;
@@ -205,6 +273,7 @@ export class Room {
       `Раунд ${this.currentRound + 1}/${this.settings.rounds} — ${drawer.name} рисует`
     );
 
+    // Send word choices only to drawer (with categories)
     this.io.to(drawerId).emit('word-choices', {
       words: this.wordChoices,
       timeLeft: this.timeLeft,
@@ -212,8 +281,12 @@ export class Room {
 
     this.broadcastState();
 
+
     this.startTimer(() => {
       if (this.state === 'choosing') {
+        const randomEntry =
+          this.wordChoices[Math.floor(Math.random() * this.wordChoices.length)];
+        this.chooseWord(drawerId, randomEntry.word);
         const randomEntry =
           this.wordChoices[Math.floor(Math.random() * this.wordChoices.length)];
         this.chooseWord(drawerId, randomEntry.word);
@@ -226,16 +299,24 @@ export class Room {
     if (!player?.isDrawing) return;
     if (this.state !== 'choosing') return;
 
+    // Find the chosen word entry to get category
     const entry = this.wordChoices.find((w) => w.word === word);
     this.currentWord = word;
+    this.currentCategory = entry?.category || '';
     this.currentCategory = entry?.category || '';
     this.state = 'drawing';
     this.timeLeft = this.settings.drawTime;
     this.revealedIndices = [];
     this.updateHint();
 
+
     this.clearTimers();
     this.broadcastState();
+
+    this.startTimer(() => {
+      this.endRound();
+    }, this.settings.drawTime);
+
 
     this.startTimer(() => {
       this.endRound();
@@ -249,6 +330,7 @@ export class Room {
     if (!player?.isDrawing) return;
     if (this.state !== 'drawing') return;
 
+
     this.drawActions.push(action);
     this.io.to(this.id).except(socketId).emit('draw-action', action);
   }
@@ -260,12 +342,15 @@ export class Room {
     if (player.hasGuessed) return;
     if (this.state !== 'drawing') return;
 
+
     const result = checkGuess(text, this.currentWord);
+
 
     if (result === 'correct') {
       player.hasGuessed = true;
       this.guessedCount++;
 
+      // Deferred scoring: accumulate but don't apply yet
       const elapsed = this.settings.drawTime - this.timeLeft;
       const guesserScore = Math.max(50, 500 - elapsed * 5);
       const drawerBonus = 50;
@@ -276,6 +361,7 @@ export class Room {
       );
       this.pendingDrawerScore += drawerBonus;
 
+      // Show correct message (without revealing the word text)
       this.addMessage(socketId, player.name, '', 'correct');
       this.addSystemMessage(`${player.name} угадал слово!`);
 
@@ -289,15 +375,23 @@ export class Room {
       } else {
         this.broadcastState();
       }
+
+      if (allGuessed) {
+        this.endRound();
+      } else {
+        this.broadcastState();
+      }
     } else if (result === 'close') {
+      // Only send "close" notification to the guesser, hide text from others
       const closeMsg: ChatMessage = {
         id: `msg-${++this.msgCounter}`,
         playerId: socketId,
         playerName: player.name,
-        text: '',
+        text: '', // Don't reveal the close guess text
         type: 'close',
         timestamp: Date.now(),
       };
+      // Send to guesser only
       this.io.to(socketId).emit('chat-message', closeMsg);
       this.io.to(socketId).emit('guess-result', { result: 'close' });
     } else {
@@ -309,6 +403,7 @@ export class Room {
     this.clearTimers();
     this.state = 'roundEnd';
 
+    // Apply deferred scores NOW
     const scoreDeltas: Record<string, number> = {};
 
     this.pendingScores.forEach((score, playerId) => {
@@ -319,6 +414,7 @@ export class Room {
       }
     });
 
+    // Apply drawer bonus
     const drawerId = this.playerOrder[this.currentDrawerIndex];
     const drawer = this.players.get(drawerId);
     if (drawer && this.pendingDrawerScore > 0) {
@@ -333,10 +429,19 @@ export class Room {
       word: this.currentWord,
       category: this.currentCategory,
       players: this.getPlayersArray(),
-      scoreDeltas,
+      scoreDeltas, // Send per-player score earned this round
     });
 
     this.broadcastState();
+
+    this.pendingScores.clear();
+    this.pendingDrawerScore = 0;
+
+    setTimeout(() => {
+      if (this.state === 'roundEnd') {
+        this.nextTurn();
+      }
+    }, 5000);
 
     this.pendingScores.clear();
     this.pendingDrawerScore = 0;
@@ -356,6 +461,11 @@ export class Room {
       (a, b) => b.score - a.score
     );
 
+
+    const sortedPlayers = this.getPlayersArray().sort(
+      (a, b) => b.score - a.score
+    );
+
     this.addSystemMessage('Игра окончена!');
 
     this.io.to(this.id).emit('game-end', {
@@ -363,7 +473,17 @@ export class Room {
       winner: sortedPlayers[0],
     });
 
+
+    this.io.to(this.id).emit('game-end', {
+      players: sortedPlayers,
+      winner: sortedPlayers[0],
+    });
+
     this.broadcastState();
+
+    setTimeout(() => {
+      this.resetToWaiting();
+    }, 10000);
 
     setTimeout(() => {
       this.resetToWaiting();
@@ -384,6 +504,7 @@ export class Room {
     this.drawActions = [];
     this.currentWord = '';
     this.currentCategory = '';
+    this.currentCategory = '';
     this.hint = '';
     this.revealedIndices = [];
     this.pendingScores.clear();
@@ -393,8 +514,17 @@ export class Room {
       p.hasGuessed = false;
       p.isDrawing = false;
     });
+    this.pendingScores.clear();
+    this.pendingDrawerScore = 0;
+    this.players.forEach((p) => {
+      p.score = 0;
+      p.hasGuessed = false;
+      p.isDrawing = false;
+    });
     this.broadcastState();
   }
+
+  // ─── Hints ────────────────────────────────────────────────────
 
   // ─── Hints ────────────────────────────────────────────────────
 
@@ -409,18 +539,31 @@ export class Room {
       this.updateHint();
       this.broadcastState();
     }
+    if (nextIdx !== null) {
+      this.revealedIndices.push(nextIdx);
+      this.updateHint();
+      this.broadcastState();
+    }
   }
 
   private startHintTimer(): void {
+    const hintInterval = 15;
     const hintInterval = 15;
     this.hintTimer = setInterval(() => {
       if (this.state !== 'drawing') {
         if (this.hintTimer) clearInterval(this.hintTimer);
         return;
       }
+      if (this.state !== 'drawing') {
+        if (this.hintTimer) clearInterval(this.hintTimer);
+        return;
+      }
       this.revealNextLetter();
     }, hintInterval * 1000);
+    }, hintInterval * 1000);
   }
+
+  // ─── Timers ───────────────────────────────────────────────────
 
   // ─── Timers ───────────────────────────────────────────────────
 
@@ -428,9 +571,15 @@ export class Room {
     this.clearTimers();
     this.timeLeft = seconds;
 
+
     this.roundTimer = setInterval(() => {
       this.timeLeft--;
       this.io.to(this.id).emit('timer-update', { timeLeft: this.timeLeft });
+
+      if (this.timeLeft <= 0) {
+        this.clearTimers();
+        callback();
+      }
 
       if (this.timeLeft <= 0) {
         this.clearTimers();
@@ -448,10 +597,34 @@ export class Room {
       clearInterval(this.hintTimer);
       this.hintTimer = null;
     }
+    if (this.roundTimer) {
+      clearInterval(this.roundTimer);
+      this.roundTimer = null;
+    }
+    if (this.hintTimer) {
+      clearInterval(this.hintTimer);
+      this.hintTimer = null;
+    }
   }
 
   // ─── Messages ─────────────────────────────────────────────────
 
+  // ─── Messages ─────────────────────────────────────────────────
+
+  private addMessage(
+    playerId: string,
+    playerName: string,
+    text: string,
+    type: ChatMessage['type']
+  ): void {
+    const msg: ChatMessage = {
+      id: `msg-${++this.msgCounter}`,
+      playerId,
+      playerName,
+      text,
+      type,
+      timestamp: Date.now(),
+    };
   private addMessage(
     playerId: string,
     playerName: string,
@@ -470,9 +643,17 @@ export class Room {
     if (this.messages.length > 100) {
       this.messages = this.messages.slice(-100);
     }
+    if (this.messages.length > 100) {
+      this.messages = this.messages.slice(-100);
+    }
     this.io.to(this.id).emit('chat-message', msg);
   }
 
+  addSystemMessage(text: string): void {
+    this.addMessage('system', 'Система', text, 'system');
+  }
+
+  // ─── State Broadcasting ───────────────────────────────────────
   addSystemMessage(text: string): void {
     this.addMessage('system', 'Система', text, 'system');
   }
@@ -482,9 +663,25 @@ export class Room {
   getPlayersArray(): Player[] {
     return Array.from(this.players.values());
   }
+  getPlayersArray(): Player[] {
+    return Array.from(this.players.values());
+  }
 
   getPublicState() {
     const drawerId = this.playerOrder[this.currentDrawerIndex];
+    return {
+      id: this.id,
+      state: this.state,
+      players: this.getPlayersArray(),
+      currentRound: this.currentRound,
+      totalRounds: this.settings.rounds,
+      drawerId,
+      hint: this.hint,
+      currentCategory: this.currentCategory,
+      timeLeft: this.timeLeft,
+      settings: this.settings,
+      drawActions: this.drawActions,
+    };
     return {
       id: this.id,
       state: this.state,
@@ -506,10 +703,17 @@ export class Room {
       currentWord: this.currentWord,
     };
   }
+  getDrawerState() {
+    return {
+      ...this.getPublicState(),
+      currentWord: this.currentWord,
+    };
+  }
 
   broadcastState(): void {
     const publicState = this.getPublicState();
     const drawerId = this.playerOrder[this.currentDrawerIndex];
+
 
     this.players.forEach((player) => {
       if (player.socketId === drawerId && this.state === 'drawing') {
@@ -531,6 +735,17 @@ export class Room {
   getHost(): Player | undefined {
     return Array.from(this.players.values()).find((p) => p.isHost);
   }
+  get isEmpty(): boolean {
+    return this.players.size === 0;
+  }
+
+  get playerCount(): number {
+    return this.players.size;
+  }
+
+  getHost(): Player | undefined {
+    return Array.from(this.players.values()).find((p) => p.isHost);
+  }
 
   updateSettings(settings: Partial<RoomSettings>): void {
     if (this.state !== 'waiting') return;
@@ -538,6 +753,13 @@ export class Room {
     this.broadcastState();
   }
 
+  destroy(): void {
+    this.clearTimers();
+    this.players.clear();
+    this.messages = [];
+    this.drawActions = [];
+    this.pendingScores.clear();
+  }
   destroy(): void {
     this.clearTimers();
     this.players.clear();
