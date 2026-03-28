@@ -32,8 +32,7 @@ export type RoomState =
   | 'chainReveal'
   // Speed mode states
   | 'speedDrawing'
-  // Reveal mode states
-  | 'revealDraw'
+  // Reveal mode state
   | 'revealing';
 
 export interface RoomSettings {
@@ -141,6 +140,8 @@ export class Room {
   // ─── Spy mode state ──────────────────────────────────────
   spyIds: string[] = [];
   spyVotes: SpyVote[] = [];
+  spyCurrentDrawerId: string = '';
+  spyTurnIndex: number = -1;
 
   // ─── Telephone mode state ────────────────────────────────
   telephoneChain: TelephoneChainLink[] = [];
@@ -152,9 +153,10 @@ export class Room {
   speedWordQueue: WordEntry[] = [];
 
   // ─── Reveal mode state ───────────────────────────────────
-  revealProgress: number = 0;
-  storedDrawing: string = '';
-  revealDrawerId: string = '';
+  revealProgress: number = 0;      // 0..100 (derived from tiles)
+  revealImageUrl: string = '';     // current image URL
+  revealedTiles: number[] = [];    // indices of revealed tiles (0..REVEAL_TILES-1)
+  revealTileOrder: number[] = [];  // pre-shuffled order to reveal
 
   constructor(id: string, io: Server, settings?: Partial<RoomSettings>, wordBankManager?: WordBankManager) {
     this.id = id;
@@ -211,10 +213,13 @@ export class Room {
       return;
     }
 
-    if (player.isDrawing && this.state === 'revealDraw') {
-      this.startRevealingPhase('');
+    if (player.isDrawing && this.state === 'spyDrawing') {
+      this.clearTimers();
+      this.startNextSpyTurn();
       return;
     }
+
+    // no special handling needed for revealing state on player leave
 
     const minPlayersToContinue =
       this.settings.mode === 'reveal' ? 1 : this.settings.mode === 'spy' ? 3 : 2;
@@ -244,6 +249,15 @@ export class Room {
 
     const idx = this.playerOrder.indexOf(oldSocketId);
     if (idx >= 0) this.playerOrder[idx] = socketId;
+
+    this.spyIds = this.spyIds.map((id) => (id === oldSocketId ? socketId : id));
+    this.spyVotes = this.spyVotes.map((v) => ({
+      voterId: v.voterId === oldSocketId ? socketId : v.voterId,
+      suspectId: v.suspectId === oldSocketId ? socketId : v.suspectId,
+    }));
+    if (this.spyCurrentDrawerId === oldSocketId) {
+      this.spyCurrentDrawerId = socketId;
+    }
 
     return true;
   }
@@ -378,16 +392,10 @@ export class Room {
       this.state !== 'speedDrawing' &&
       this.state !== 'spyDrawing' &&
       this.state !== 'allDrawing' &&
-      this.state !== 'chainDraw' &&
-      this.state !== 'revealDraw'
+      this.state !== 'chainDraw'
     ) return;
 
-    if (
-      this.state === 'allDrawing' ||
-      this.state === 'chainDraw' ||
-      this.state === 'spyDrawing' ||
-      this.state === 'revealDraw'
-    ) return;
+    if (this.state === 'allDrawing' || this.state === 'chainDraw') return;
 
     this.drawActions.push(action);
     this.io.to(this.id).except(socketId).emit('draw-action', action);
@@ -401,16 +409,10 @@ export class Room {
       this.state !== 'speedDrawing' &&
       this.state !== 'spyDrawing' &&
       this.state !== 'allDrawing' &&
-      this.state !== 'chainDraw' &&
-      this.state !== 'revealDraw'
+      this.state !== 'chainDraw'
     ) return;
 
-    if (
-      this.state === 'allDrawing' ||
-      this.state === 'chainDraw' ||
-      this.state === 'spyDrawing' ||
-      this.state === 'revealDraw'
-    ) return;
+    if (this.state === 'allDrawing' || this.state === 'chainDraw') return;
 
     this.drawActions.push(...actions);
     this.io.to(this.id).except(socketId).emit('draw-batch', actions);
@@ -591,9 +593,13 @@ export class Room {
     this.galleryScores.clear();
     this.spyVotes = [];
     this.spyIds = [];
+    this.spyCurrentDrawerId = '';
+    this.spyTurnIndex = -1;
     this.telephoneChain = [];
-    this.storedDrawing = '';
-    this.revealDrawerId = '';
+    this.revealImageUrl = '';
+    this.revealedTiles = [];
+    this.revealTileOrder = [];
+    this.revealProgress = 0;
     this.speedWordsGuessed = 0;
     this.speedWordQueue = [];
     this.players.forEach((p) => {
@@ -661,15 +667,7 @@ export class Room {
   }
 
   handleGallerySubmit(socketId: string, dataUrl: string): void {
-    // Reveal draw phase: only the designated drawer submits
-    if (this.state === 'revealDraw') {
-      if (socketId !== this.revealDrawerId) return;
-      this.clearTimers();
-      this.startRevealingPhase(dataUrl);
-      return;
-    }
-
-    if (this.state !== 'allDrawing' && this.state !== 'spyDrawing') return;
+    if (this.state !== 'allDrawing') return;
     const player = this.players.get(socketId);
     if (!player || player.isEliminated || !player.isDrawing) return;
 
@@ -691,9 +689,6 @@ export class Room {
     if (this.galleryReadyIds.length >= requiredPlayers) {
       if (this.state === 'allDrawing') {
         this.endGalleryDrawing();
-      } else if (this.state === 'spyDrawing') {
-        this.clearTimers();
-        this.startSpyVoting();
       }
     }
   }
@@ -786,69 +781,116 @@ export class Room {
   // ═══════════════════════════════════════════════════════════
 
   private startSpyRound(): void {
-    const activePlayers = Array.from(this.players.values()).filter(
-      (p) => !p.isEliminated && p.connected
-    );
+    const activePlayers = Array.from(this.players.values()).filter((p) => !p.isEliminated && p.connected);
     if (activePlayers.length < 3) {
-      const activeSpies = activePlayers.filter((p) =>
-        this.spyIds.includes(p.socketId)
-      ).length;
+      const activeSpies = activePlayers.filter((p) => this.spyIds.includes(p.socketId)).length;
       this.endSpyMatchFinal(activeSpies > 0, {}, '');
       return;
     }
 
     this.spyVotes = [];
+    this.spyTurnIndex = -1;
+    this.spyCurrentDrawerId = '';
     this.drawActions = [];
-    this.guessOrder = [];
-    this.messages = [];
     this.galleryDrawings = [];
     this.galleryReadyIds = [];
+    this.guessOrder = [];
+    this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
 
-    // Select spies only once, at match start
+    // Match initialization: one word for all circles.
     if (this.currentRound === 0) {
       const desiredSpyCount = this.settings.spyCount || 1;
-      const actualSpyCount = Math.min(
-        desiredSpyCount,
-        Math.max(1, this.players.size - 2)
-      );
+      const actualSpyCount = Math.min(desiredSpyCount, Math.max(1, activePlayers.length - 2));
 
       this.spyIds = [];
-      const playerIds = Array.from(this.players.keys());
+      const eligibleIds = activePlayers.map((p) => p.socketId);
       for (let i = 0; i < actualSpyCount; i++) {
-        if (playerIds.length === 0) break;
-        const randIdx = Math.floor(Math.random() * playerIds.length);
-        this.spyIds.push(playerIds.splice(randIdx, 1)[0]);
+        if (eligibleIds.length === 0) break;
+        const randIdx = Math.floor(Math.random() * eligibleIds.length);
+        this.spyIds.push(eligibleIds.splice(randIdx, 1)[0]);
       }
+
+      const words = getRandomWords(1, this.getWordPool());
+      this.currentWord = words[0].word;
+      this.currentCategory = words[0].category;
     }
-    this.currentRound++;
 
-    const words = getRandomWords(1, this.getWordPool());
-    this.currentWord = words[0].word;
-    this.currentCategory = words[0].category;
+    this.currentRound = 1;
+    this.addSystemMessage(
+      `Шпион-режим: ${this.settings.rounds} круг(а), ${this.settings.drawTime} сек. на ход. Затем голосование.`
+    );
+    this.emitSpyRoles();
+    this.startNextSpyTurn();
+  }
 
-    this.addSystemMessage(`Раунд ${this.currentRound} — Все рисуют, затем голосуют за шпиона.`);
+  private emitSpyRoles(): void {
+    this.players.forEach((player) => {
+      if (this.spyIds.includes(player.socketId)) {
+        this.io.to(player.socketId).emit('spy-role', {
+          role: 'spy',
+          word: null,
+          category: this.currentCategory,
+        });
+      } else {
+        this.io.to(player.socketId).emit('spy-role', {
+          role: 'player',
+          word: this.currentWord,
+          category: this.currentCategory,
+        });
+      }
+    });
+  }
 
+  private getActiveSpyPlayerIds(): string[] {
+    return this.playerOrder.filter((id) => {
+      const p = this.players.get(id);
+      return Boolean(p && p.connected && !p.isEliminated);
+    });
+  }
+
+  private startNextSpyTurn(): void {
+    const activeIds = this.getActiveSpyPlayerIds();
+    if (activeIds.length < 3) {
+      const activeSpies = activeIds.filter((id) => this.spyIds.includes(id)).length;
+      this.endSpyMatchFinal(activeSpies > 0, {}, this.spyCurrentDrawerId);
+      return;
+    }
+
+    this.spyTurnIndex++;
+    if (this.spyTurnIndex >= activeIds.length) {
+      if (this.currentRound >= this.settings.rounds) {
+        this.startSpyVoting();
+        return;
+      }
+      this.currentRound++;
+      this.spyTurnIndex = 0;
+      this.addSystemMessage(`Круг ${this.currentRound}/${this.settings.rounds}`);
+    }
+
+    const drawerId = activeIds[this.spyTurnIndex];
+    const drawer = this.players.get(drawerId);
+    if (!drawer) {
+      this.startNextSpyTurn();
+      return;
+    }
+
+    this.spyCurrentDrawerId = drawerId;
     this.state = 'spyDrawing';
-    this.timeLeft = Math.min(this.settings.drawTime, 90);
+    this.timeLeft = Math.max(3, Math.min(this.settings.drawTime, 120));
+    this.drawActions = [];
 
     this.players.forEach((p) => {
-      p.isDrawing = !p.isEliminated;
+      p.isDrawing = p.socketId === drawerId;
       p.hasGuessed = false;
     });
 
-    this.players.forEach((player) => {
-      if (this.spyIds.includes(player.socketId)) {
-        this.io.to(player.socketId).emit('spy-role', { role: 'spy', word: null });
-      } else {
-        this.io.to(player.socketId).emit('spy-role', { role: 'player', word: this.currentWord, category: this.currentCategory });
-      }
-    });
-
+    this.io.to(this.id).emit('clear-canvas');
+    this.addSystemMessage(`Ход ${drawer.name} (${this.currentRound}/${this.settings.rounds})`);
     this.broadcastState();
 
     this.startTimer(() => {
-      this.startSpyVoting();
+      this.startNextSpyTurn();
     }, this.timeLeft);
   }
 
@@ -857,13 +899,20 @@ export class Room {
     this.state = 'spyVoting';
     this.timeLeft = 30;
     this.spyVotes = [];
+    this.spyCurrentDrawerId = '';
 
     this.players.forEach(p => { p.isDrawing = false; });
 
-    this.players.forEach(p => {
-      if (!p.isEliminated && p.connected && !this.galleryDrawings.find(d => d.playerId === p.socketId)) {
-        this.galleryDrawings.push({ playerId: p.socketId, playerName: p.name, dataUrl: '' });
-      }
+    const activeIds = this.getActiveSpyPlayerIds();
+    this.galleryDrawings = [];
+    activeIds.forEach((id) => {
+      const p = this.players.get(id);
+      if (!p) return;
+      this.galleryDrawings.push({
+        playerId: p.socketId,
+        playerName: p.name,
+        dataUrl: '',
+      });
     });
 
     this.io.to(this.id).emit('spy-vote-start', {
@@ -890,7 +939,7 @@ export class Room {
     this.spyVotes = this.spyVotes.filter(v => v.voterId !== socketId);
     this.spyVotes.push({ voterId: socketId, suspectId });
 
-    const activeCount = Array.from(this.players.values()).filter(p => !p.isEliminated && p.connected).length;
+    const activeCount = this.getActiveSpyPlayerIds().length;
     if (this.spyVotes.length >= activeCount) {
       this.endSpyVoting();
     }
@@ -935,15 +984,9 @@ export class Room {
   }
 
   private checkSpyWinCondition(lastEliminatedId: string, voteCounts: Record<string, number>): void {
-    let activeSpies = 0;
-    let activeInnocents = 0;
-
-    this.players.forEach(p => {
-      if (!p.isEliminated && p.connected) {
-        if (this.spyIds.includes(p.socketId)) activeSpies++;
-        else activeInnocents++;
-      }
-    });
+    const activeIds = this.getActiveSpyPlayerIds();
+    const activeSpies = activeIds.filter((id) => this.spyIds.includes(id)).length;
+    const activeInnocents = activeIds.length - activeSpies;
 
     const spiesWin = activeSpies > 0 && activeSpies >= activeInnocents;
     const innocentsWin = activeSpies === 0;
@@ -969,7 +1012,10 @@ export class Room {
       this.broadcastState();
 
       this.startTimer(() => {
-        this.startSpyRound();
+        this.spyTurnIndex = -1;
+        this.spyCurrentDrawerId = '';
+        this.currentRound = 1;
+        this.startNextSpyTurn();
       }, 5000);
     }
   }
@@ -1371,11 +1417,21 @@ export class Room {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // REVEAL MODE
-  //   Single player  → hints only (letter-by-letter reveal)
-  //   Multiplayer    → one player draws (hidden), others guess
-  //                    while the image is progressively un-blurred
+  // REVEAL MODE  —  Image bank + tile-based reveal
+  //   All players see the SAME image from the bank.
+  //   Random tiles are uncovered every few seconds.
+  //   First to guess the word scores the most points.
+  //   Works for 1..N players.
   // ═══════════════════════════════════════════════════════════
+
+  // Total number of tiles in the reveal grid (8×8)
+  static readonly REVEAL_GRID = 8;
+  static readonly REVEAL_TOTAL_TILES = Room.REVEAL_GRID * Room.REVEAL_GRID; // 64
+
+  // How many tiles to uncover per interval tick
+  static readonly TILES_PER_TICK = 3;
+  // Interval between tile reveals (ms)
+  static readonly REVEAL_TICK_MS = 3000;
 
   private startRevealRound(): void {
     this.currentRound++;
@@ -1384,17 +1440,16 @@ export class Room {
       return;
     }
 
+    // ── Reset state ──────────────────────────────────────────
     this.drawActions = [];
     this.revealedIndices = [];
     this.guessedCount = 0;
     this.guessOrder = [];
     this.pendingScores.clear();
     this.revealProgress = 0;
-    this.storedDrawing = '';
-    this.revealDrawerId = '';
+    this.revealedTiles = [];
     this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
-    this.io.to(this.id).emit('clear-canvas');
 
     this.players.forEach((p) => {
       p.hasGuessed = false;
@@ -1402,140 +1457,103 @@ export class Room {
       p.guessedAt = 0;
     });
 
+    // ── Pick random word and resolve image dynamically on server ──
     const words = getRandomWords(1, this.getWordPool());
     this.currentWord = words[0].word;
     this.currentCategory = words[0].category;
-    this.updateHint();
+    this.revealImageUrl = `/api/reveal-image?word=${encodeURIComponent(this.currentWord)}`;
+    this.updateHint(); // letter-hint backup
 
-    const isSinglePlayer = this.players.size === 1;
+    // ── Pre-shuffle tile reveal order ────────────────────────
+    const total = Room.REVEAL_TOTAL_TILES;
+    this.revealTileOrder = Array.from({ length: total }, (_, i) => i)
+      .sort(() => Math.random() - 0.5);
 
-    if (isSinglePlayer) {
-      this.addSystemMessage(
-        `Раунд ${this.currentRound}/${this.settings.rounds} — Угадайте слово по буквенным подсказкам!`
-      );
-      this.state = 'revealing';
-      this.timeLeft = this.settings.drawTime;
-
-      this.io.to(this.id).emit('reveal-start', {
-        hint: this.hint,
-        category: this.currentCategory,
-        timeLeft: this.timeLeft,
-        imageUrl: '',
-      });
-
-      this.broadcastState();
-      this.startRevealInterval();
-      this.startTimer(() => this.endRevealRound(), this.settings.drawTime);
-    } else {
-      this.currentDrawerIndex++;
-      if (this.currentDrawerIndex >= this.playerOrder.length) {
-        this.currentDrawerIndex = 0;
-      }
-
-      const drawerId = this.playerOrder[this.currentDrawerIndex];
-      const drawer = this.players.get(drawerId);
-      if (!drawer) {
-        this.startRevealRound();
-        return;
-      }
-
-      drawer.isDrawing = true;
-      this.revealDrawerId = drawerId;
-
-      const drawTime = Math.min(this.settings.drawTime, 60);
-      this.state = 'revealDraw';
-      this.timeLeft = drawTime;
-
-      this.addSystemMessage(
-        `Раунд ${this.currentRound}/${this.settings.rounds} — ${drawer.name} рисует (скрыто). Угадайте что нарисовано!`
-      );
-
-      this.io.to(drawerId).emit('reveal-draw-start', {
-        word: this.currentWord,
-        category: this.currentCategory,
-        timeLeft: drawTime,
-      });
-
-      this.broadcastState();
-      this.startTimer(() => this.startRevealingPhase(''), drawTime);
-    }
-  }
-
-  private startRevealingPhase(imageUrl: string): void {
-    this.clearTimers();
-    this.storedDrawing = imageUrl;
-    this.state = 'revealing';
+    this.state    = 'revealing';
     this.timeLeft = this.settings.drawTime;
-    this.revealProgress = 0;
 
-    this.players.forEach((p) => { p.isDrawing = false; });
+    this.addSystemMessage(
+      `Раунд ${this.currentRound}/${this.settings.rounds} — Угадайте что на картинке!`
+    );
 
+    // Send reveal-start with image URL and empty tile list
     this.io.to(this.id).emit('reveal-start', {
-      hint: this.hint,
+      imageUrl: this.revealImageUrl,
       category: this.currentCategory,
+      hint: this.hint,
       timeLeft: this.timeLeft,
-      imageUrl: this.storedDrawing,
+      totalTiles: total,
+      revealedTiles: [],
     });
 
     this.broadcastState();
-    this.startRevealInterval();
     this.startTimer(() => this.endRevealRound(), this.settings.drawTime);
+    this.startRevealInterval();
   }
 
+  /** Uncover TILES_PER_TICK random tiles each tick. */
   private startRevealInterval(): void {
     this.hintTimer = setInterval(() => {
       if (this.state !== 'revealing') {
         if (this.hintTimer) clearInterval(this.hintTimer);
         return;
       }
-      this.revealProgress = Math.min(100, this.revealProgress + 5);
-      this.io.to(this.id).emit('reveal-progress', { progress: this.revealProgress });
-      this.revealNextLetter();
-    }, 3000);
+
+      const uncovered = this.revealedTiles.length;
+      const total     = Room.REVEAL_TOTAL_TILES;
+      if (uncovered >= total) return; // all tiles revealed already
+
+      for (let i = 0; i < Room.TILES_PER_TICK && this.revealedTiles.length < total; i++) {
+        this.revealedTiles.push(this.revealTileOrder[this.revealedTiles.length]);
+      }
+
+      this.revealProgress = Math.round((this.revealedTiles.length / total) * 100);
+
+      // Reveal a letter hint every two ticks
+      if (this.revealedTiles.length % (Room.TILES_PER_TICK * 2) < Room.TILES_PER_TICK) {
+        this.revealNextLetter();
+      }
+
+      this.io.to(this.id).emit('reveal-tile', {
+        revealedTiles: this.revealedTiles,
+        progress: this.revealProgress,
+        hint: this.hint,
+      });
+    }, Room.REVEAL_TICK_MS);
   }
 
   handleRevealGuess(socketId: string, text: string): void {
     if (this.state !== 'revealing') return;
     const player = this.players.get(socketId);
     if (!player || player.hasGuessed) return;
-    if (socketId === this.revealDrawerId) return;
 
     const result = checkGuess(text, this.currentWord);
 
     if (result === 'correct') {
       player.hasGuessed = true;
-      player.guessedAt = Date.now();
+      player.guessedAt  = Date.now();
       this.guessedCount++;
 
-      const score = Math.max(50, Math.floor(500 * (1 - this.revealProgress / 100)));
+      // More tiles hidden → higher score
+      const hiddenFraction = 1 - this.revealedTiles.length / Room.REVEAL_TOTAL_TILES;
+      const score = Math.max(50, Math.round(500 * hiddenFraction));
 
-      const orderEntry: GuessOrderEntry = {
-        playerId: socketId,
-        playerName: player.name,
-        position: this.guessedCount,
+      this.guessOrder.push({
+        playerId:    socketId,
+        playerName:  player.name,
+        position:    this.guessedCount,
         score,
         timeElapsed: this.settings.drawTime - this.timeLeft,
-      };
-      this.guessOrder.push(orderEntry);
+      });
       this.pendingScores.set(socketId, (this.pendingScores.get(socketId) || 0) + score);
-
-      if (this.revealDrawerId) {
-        const drawer = this.players.get(this.revealDrawerId);
-        if (drawer) {
-          this.pendingScores.set(
-            this.revealDrawerId,
-            (this.pendingScores.get(this.revealDrawerId) || 0) + score,
-          );
-        }
-      }
 
       this.addMessage(socketId, player.name, '', 'correct');
       this.addSystemMessage(`${player.name} угадал слово!`);
 
-      const guessers = Array.from(this.players.values()).filter(
-        (p) => p.connected && p.socketId !== this.revealDrawerId,
-      );
-      const allGuessed = guessers.every((p) => p.hasGuessed);
+      const allGuessed = Array.from(this.players.values())
+        .filter((p) => p.connected)
+        .every((p) => p.hasGuessed);
+
       if (allGuessed) {
         this.endRevealRound();
       } else {
@@ -1543,12 +1561,12 @@ export class Room {
       }
     } else if (result === 'close') {
       const closeMsg: ChatMessage = {
-        id: `msg-${++this.msgCounter}`,
-        playerId: socketId,
+        id:         `msg-${++this.msgCounter}`,
+        playerId:   socketId,
         playerName: player.name,
-        text: '',
-        type: 'close',
-        timestamp: Date.now(),
+        text:       '',
+        type:       'close',
+        timestamp:  Date.now(),
       };
       this.io.to(socketId).emit('chat-message', closeMsg);
     } else {
@@ -1564,18 +1582,19 @@ export class Room {
     this.pendingScores.forEach((score, playerId) => {
       const player = this.players.get(playerId);
       if (player) {
-        player.score += score;
+        player.score     += score;
         scoreDeltas[playerId] = score;
       }
     });
 
     this.io.to(this.id).emit('round-end', {
-      word: this.currentWord,
-      category: this.currentCategory,
-      players: this.getPlayersArray(),
+      word:       this.currentWord,
+      category:   this.currentCategory,
+      players:    this.getPlayersArray(),
       scoreDeltas,
       guessOrder: this.guessOrder,
-      mode: 'reveal',
+      mode:       'reveal',
+      revealImageUrl: this.revealImageUrl,
     });
 
     this.broadcastState();
@@ -1680,11 +1699,9 @@ export class Room {
     if (this.state === 'allDrawing' || this.state === 'voting') {
       drawerId = 'all';
     } else if (this.state === 'spyDrawing') {
-      drawerId = 'all';
+      drawerId = this.spyCurrentDrawerId;
     } else if (this.state === 'chainDraw' || this.state === 'chainGuess') {
       drawerId = this.playerOrder[this.chainCurrentIndex];
-    } else if (this.state === 'revealDraw') {
-      drawerId = this.revealDrawerId;
     }
 
     return {
@@ -1702,6 +1719,8 @@ export class Room {
       drawActions: this.drawActions,
       speedWordsGuessed: this.speedWordsGuessed,
       revealProgress: this.revealProgress,
+      revealedTiles: this.revealedTiles,
+      revealImageUrl: this.revealImageUrl,
       galleryReadyIds: this.galleryReadyIds,
       galleryVotedIds:
         this.state === 'spyVoting'
@@ -1726,11 +1745,10 @@ export class Room {
       const showWord = isCurrentDrawer && (
         this.state === 'drawing' ||
         this.state === 'speedDrawing' ||
-        this.state === 'allDrawing' ||
-        this.state === 'revealDraw'
+        this.state === 'allDrawing'
       );
 
-      if (showWord) {
+        if (showWord) {
         this.io.to(player.socketId).emit('game-state', this.getDrawerState());
       } else if (this.state === 'allDrawing') {
         this.io.to(player.socketId).emit('game-state', {

@@ -119,7 +119,7 @@ export function getLetterCount(word: string): number {
  * Max 30% of letters can be revealed as hints
  */
 export function getMaxRevealCount(word: string): number {
-  return Math.floor(getLetterCount(word) * 0.3);
+  return Math.floor(getLetterCount(word) * 0.4);
 }
 
 export function getRandomWords(count: number = 3, wordPool?: WordEntry[]): WordEntry[] {

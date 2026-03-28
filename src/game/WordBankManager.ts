@@ -17,19 +17,45 @@ export class WordBankManager {
    */
   addBank(name: string, categories: Record<string, string[]>): WordBankData {
     const id = uuidv4().slice(0, 8);
-    let wordCount = 0;
-    for (const words of Object.values(categories)) {
-      wordCount += words.length;
-    }
+    const normalizedCategories = this.normalizeCategories(categories);
+    const wordCount = this.countWords(normalizedCategories);
     const bank: WordBankData = {
       id,
       name,
-      categories,
+      categories: normalizedCategories,
       wordCount,
       createdAt: Date.now(),
     };
     this.banks.set(id, bank);
     console.log(`📚 Word bank "${name}" added with ${wordCount} words (id: ${id})`);
+    return bank;
+  }
+
+  /**
+   * Update bank categories/words.
+   * mode=replace -> overwrite all categories
+   * mode=merge   -> merge/update provided categories only
+   */
+  updateBankCategories(
+    id: string,
+    categories: Record<string, string[]>,
+    mode: 'replace' | 'merge' = 'merge'
+  ): WordBankData | null {
+    const bank = this.banks.get(id);
+    if (!bank) return null;
+
+    const normalizedIncoming = this.normalizeCategories(categories);
+    const nextCategories =
+      mode === 'replace'
+        ? normalizedIncoming
+        : {
+            ...bank.categories,
+            ...normalizedIncoming,
+          };
+
+    bank.categories = nextCategories;
+    bank.wordCount = this.countWords(nextCategories);
+    this.banks.set(id, bank);
     return bank;
   }
 
@@ -87,5 +113,27 @@ export class WordBankManager {
 
   get bankCount(): number {
     return this.banks.size;
+  }
+
+  private countWords(categories: Record<string, string[]>): number {
+    let wordCount = 0;
+    for (const words of Object.values(categories)) {
+      wordCount += words.length;
+    }
+    return wordCount;
+  }
+
+  private normalizeCategories(categories: Record<string, string[]>): Record<string, string[]> {
+    const result: Record<string, string[]> = {};
+    for (const [rawCategory, rawWords] of Object.entries(categories || {})) {
+      const category = rawCategory.trim();
+      if (!category) continue;
+      const cleanedWords = (rawWords || [])
+        .map((w) => String(w).trim())
+        .filter(Boolean);
+      // Keep unique words preserving original order
+      result[category] = Array.from(new Set(cleanedWords));
+    }
+    return result;
   }
 }
