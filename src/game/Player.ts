@@ -8,6 +8,10 @@ export interface Player {
   isDrawing: boolean;
   isHost: boolean;
   connected: boolean;
+  /** Timestamp when the player guessed correctly (for ordering) */
+  guessedAt: number;
+  /** Is the player eliminated (e.g. in Spy Mode) */
+  isEliminated?: boolean;
 }
 
 export function createPlayer(socketId: string, name: string, isHost: boolean = false): Player {
@@ -21,5 +25,7 @@ export function createPlayer(socketId: string, name: string, isHost: boolean = f
     isDrawing: false,
     isHost,
     connected: true,
+    guessedAt: 0,
+    isEliminated: false,
   };
 }

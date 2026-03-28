@@ -108,8 +108,23 @@ const WORD_BANK: WordEntry[] = [
   ].map((w) => ({ word: w, category: 'Сложные' })),
 ];
 
-export function getRandomWords(count: number = 3): WordEntry[] {
-  const shuffled = [...WORD_BANK].sort(() => Math.random() - 0.5);
+/**
+ * Get count of revealable letters (non-space, non-dash chars)
+ */
+export function getLetterCount(word: string): number {
+  return word.split('').filter((ch) => ch !== ' ' && ch !== '-' && ch !== '–').length;
+}
+
+/**
+ * Max 30% of letters can be revealed as hints
+ */
+export function getMaxRevealCount(word: string): number {
+  return Math.floor(getLetterCount(word) * 0.3);
+}
+
+export function getRandomWords(count: number = 3, wordPool?: WordEntry[]): WordEntry[] {
+  const pool = wordPool || WORD_BANK;
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
   return shuffled.slice(0, count);
 }
 
@@ -123,8 +138,8 @@ export function generateHint(word: string, revealedCount: number): string {
   const toReveal = new Set(shuffledIndices.slice(0, revealedCount));
   return chars
     .map((ch, i) => {
-      if (ch === ' ') return '  ';
-      if (ch === '-' || ch === '–') return ch;
+      if (ch === ' ') return '   '; // Triple space for word separator in compound words
+      if (ch === '-' || ch === '–') return ` ${ch} `;
       return toReveal.has(i) ? ch : '_';
     })
     .join(' ');
@@ -138,8 +153,8 @@ export function generateHintProgressive(
   const revealed = new Set(revealedIndices);
   return chars
     .map((ch, i) => {
-      if (ch === ' ') return '  ';
-      if (ch === '-' || ch === '–') return ch;
+      if (ch === ' ') return '   '; // Triple space for word separator in compound words
+      if (ch === '-' || ch === '–') return ` ${ch} `;
       return revealed.has(i) ? ch : '_';
     })
     .join(' ');
@@ -149,6 +164,9 @@ export function getNextRevealIndex(
   word: string,
   alreadyRevealed: number[]
 ): number | null {
+  // Enforce 30% max limit
+  if (alreadyRevealed.length >= getMaxRevealCount(word)) return null;
+
   const chars = word.split('');
   const revealed = new Set(alreadyRevealed);
   const available: number[] = [];
