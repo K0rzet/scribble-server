@@ -76,7 +76,7 @@ export interface GuessOrderEntry {
 export interface GalleryDrawing {
   playerId: string;
   playerName: string;
-  dataUrl: string; // base64 image
+  dataUrl: string;
 }
 
 // ─── Spy Mode types ──────────────────────────────────────────
@@ -90,8 +90,8 @@ export interface TelephoneChainLink {
   playerId: string;
   playerName: string;
   type: 'draw' | 'guess';
-  dataUrl?: string; // base64 image for draw
-  text?: string;    // guessed text
+  dataUrl?: string;
+  text?: string;
 }
 
 const DEFAULT_SETTINGS: RoomSettings = {
@@ -114,8 +114,6 @@ export class Room {
   currentWord: string = '';
   currentCategory: string = '';
   wordChoices: WordEntry[] = [];
-  currentCategory: string = '';
-  wordChoices: WordEntry[] = [];
   hint: string = '';
   revealedIndices: number[] = [];
   drawActions: DrawAction[] = [];
@@ -125,7 +123,7 @@ export class Room {
   playerOrder: string[] = [];
   guessOrder: GuessOrderEntry[] = [];
 
-  // Deferred scoring: accumulate during round, apply at end
+  // Deferred scoring
   private pendingScores: Map<string, number> = new Map();
   private pendingDrawerScore: number = 0;
 
@@ -137,8 +135,8 @@ export class Room {
 
   // ─── Gallery mode state ──────────────────────────────────
   galleryDrawings: GalleryDrawing[] = [];
-  galleryScores: Map<string, Record<string, number>> = new Map(); // voterId -> { targetId: score }
-  galleryReadyIds: string[] = []; // IDs of players who clicked "Ready"
+  galleryScores: Map<string, Record<string, number>> = new Map();
+  galleryReadyIds: string[] = [];
 
   // ─── Spy mode state ──────────────────────────────────────
   spyIds: string[] = [];
@@ -147,16 +145,16 @@ export class Room {
   // ─── Telephone mode state ────────────────────────────────
   telephoneChain: TelephoneChainLink[] = [];
   chainCurrentIndex: number = 0;
-  chainCurrentWord: string = ''; // the word being drawn/guessed in current chain step
+  chainCurrentWord: string = '';
 
   // ─── Speed mode state ────────────────────────────────────
   speedWordsGuessed: number = 0;
   speedWordQueue: WordEntry[] = [];
 
   // ─── Reveal mode state ───────────────────────────────────
-  revealProgress: number = 0; // 0..100 percent revealed
-  storedDrawing: string = ''; // base64 of drawing to reveal
-  revealDrawerId: string = ''; // who draws in revealDraw phase
+  revealProgress: number = 0;
+  storedDrawing: string = '';
+  revealDrawerId: string = '';
 
   constructor(id: string, io: Server, settings?: Partial<RoomSettings>, wordBankManager?: WordBankManager) {
     this.id = id;
@@ -170,12 +168,10 @@ export class Room {
     if (!this.wordBankManager) return undefined;
     const bankIds = this.settings.wordBankIds;
     if (!bankIds || bankIds.length === 0 || bankIds.includes('all')) {
-      // Merge default + custom
       const customWords = this.wordBankManager.getWords(['all']);
-      if (customWords.length === 0) return undefined; // use default
+      if (customWords.length === 0) return undefined;
       return [...WORD_BANK, ...customWords];
     }
-    // Use only selected banks  
     const bankWords = this.wordBankManager.getWords(bankIds);
     return bankWords.length > 0 ? bankWords : undefined;
   }
@@ -186,11 +182,9 @@ export class Room {
     if (this.players.size >= this.settings.maxPlayers) return null;
     if (this.players.has(socketId)) return this.players.get(socketId)!;
 
-
     const isHost = this.players.size === 0;
     const player = createPlayer(socketId, name, isHost);
     this.players.set(socketId, player);
-
 
     this.addSystemMessage(`${player.name} присоединился к игре`);
     this.broadcastState();
@@ -201,37 +195,16 @@ export class Room {
     const player = this.players.get(socketId);
     if (!player) return;
 
-
     this.players.delete(socketId);
     this.playerOrder = this.playerOrder.filter((id) => id !== socketId);
     this.pendingScores.delete(socketId);
-    this.pendingScores.delete(socketId);
     this.addSystemMessage(`${player.name} покинул игру`);
-
 
     if (player.isHost && this.players.size > 0) {
       const newHost = this.players.values().next().value!;
       newHost.isHost = true;
       this.addSystemMessage(`${newHost.name} теперь хост`);
     }
-
-    if (player.isDrawing && this.state === 'drawing') {
-      this.endRound();
-      return;
-    }
-
-    if (player.isDrawing && this.state === 'revealDraw') {
-      this.startRevealingPhase('');
-      return;
-    }
-
-    const minPlayersToContinue =
-      this.settings.mode === 'reveal' ? 1 : this.settings.mode === 'spy' ? 3 : 2;
-    if (this.players.size < minPlayersToContinue && this.state !== 'waiting') {
-      this.stopGame();
-      return;
-    }
-
 
     if (player.isDrawing && this.state === 'drawing') {
       this.endRound();
@@ -257,14 +230,12 @@ export class Room {
     const player = this.players.get(oldSocketId);
     if (!player) return false;
 
-
     this.players.delete(oldSocketId);
     player.socketId = socketId;
     player.id = socketId;
     player.connected = true;
     this.players.set(socketId, player);
 
-    // Transfer pending score
     const pending = this.pendingScores.get(oldSocketId);
     if (pending !== undefined) {
       this.pendingScores.delete(oldSocketId);
@@ -274,7 +245,6 @@ export class Room {
     const idx = this.playerOrder.indexOf(oldSocketId);
     if (idx >= 0) this.playerOrder[idx] = socketId;
 
-
     return true;
   }
 
@@ -282,8 +252,7 @@ export class Room {
 
   startGame(): void {
     const mode = this.settings.mode;
-    
-    // Reveal mode supports single player
+
     if (mode === 'reveal') {
       if (this.players.size < 1) return;
     } else if (mode === 'spy') {
@@ -292,7 +261,6 @@ export class Room {
       if (this.players.size < 2) return;
     }
     if (this.state !== 'waiting') return;
-
 
     this.currentRound = 0;
     this.playerOrder = Array.from(this.players.keys());
@@ -303,34 +271,15 @@ export class Room {
       p.isEliminated = false;
     });
 
-
-    this.players.forEach((p) => {
-      p.score = 0;
-      p.isEliminated = false;
-    });
-
     this.addSystemMessage('Игра началась!');
 
-    // Dispatch to mode-specific start
     switch (mode) {
-      case 'gallery':
-        this.startGalleryRound();
-        break;
-      case 'spy':
-        this.startSpyRound();
-        break;
-      case 'telephone':
-        this.startTelephoneRound();
-        break;
-      case 'speed':
-        this.startSpeedRound();
-        break;
-      case 'reveal':
-        this.startRevealRound();
-        break;
-      default:
-        this.nextTurn();
-        break;
+      case 'gallery':   this.startGalleryRound(); break;
+      case 'spy':       this.startSpyRound(); break;
+      case 'telephone': this.startTelephoneRound(); break;
+      case 'speed':     this.startSpeedRound(); break;
+      case 'reveal':    this.startRevealRound(); break;
+      default:          this.nextTurn(); break;
     }
   }
 
@@ -340,7 +289,6 @@ export class Room {
     this.guessedCount = 0;
     this.currentWord = '';
     this.currentCategory = '';
-    this.currentCategory = '';
     this.hint = '';
     this.guessOrder = [];
     this.pendingScores.clear();
@@ -349,18 +297,7 @@ export class Room {
     // Clear chat for new round
     this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
-    this.players.forEach((p) => {
-      p.hasGuessed = false;
-      p.isDrawing = false;
-      p.guessedAt = 0;
-    });
 
-    this.pendingScores.clear();
-    this.pendingDrawerScore = 0;
-
-    // Clear chat for new round
-    this.messages = [];
-    this.io.to(this.id).emit('chat-cleared');
     this.players.forEach((p) => {
       p.hasGuessed = false;
       p.isDrawing = false;
@@ -376,21 +313,10 @@ export class Room {
         this.endGame();
         return;
       }
-
-      if (this.currentRound >= this.settings.rounds) {
-        this.endGame();
-        return;
-      }
     }
-
 
     const drawerId = this.playerOrder[this.currentDrawerIndex];
     const drawer = this.players.get(drawerId);
-    if (!drawer) {
-      this.nextTurn();
-      return;
-    }
-
     if (!drawer) {
       this.nextTurn();
       return;
@@ -405,7 +331,6 @@ export class Room {
       `Раунд ${this.currentRound + 1}/${this.settings.rounds} — ${drawer.name} рисует`
     );
 
-    // Send word choices only to drawer (with categories)
     this.io.to(drawerId).emit('word-choices', {
       words: this.wordChoices,
       timeLeft: this.timeLeft,
@@ -413,12 +338,8 @@ export class Room {
 
     this.broadcastState();
 
-
     this.startTimer(() => {
       if (this.state === 'choosing') {
-        const randomEntry =
-          this.wordChoices[Math.floor(Math.random() * this.wordChoices.length)];
-        this.chooseWord(drawerId, randomEntry.word);
         const randomEntry =
           this.wordChoices[Math.floor(Math.random() * this.wordChoices.length)];
         this.chooseWord(drawerId, randomEntry.word);
@@ -431,24 +352,16 @@ export class Room {
     if (!player?.isDrawing) return;
     if (this.state !== 'choosing') return;
 
-    // Find the chosen word entry to get category
     const entry = this.wordChoices.find((w) => w.word === word);
     this.currentWord = word;
-    this.currentCategory = entry?.category || '';
     this.currentCategory = entry?.category || '';
     this.state = 'drawing';
     this.timeLeft = this.settings.drawTime;
     this.revealedIndices = [];
     this.updateHint();
 
-
     this.clearTimers();
     this.broadcastState();
-
-    this.startTimer(() => {
-      this.endRound();
-    }, this.settings.drawTime);
-
 
     this.startTimer(() => {
       this.endRound();
@@ -460,11 +373,21 @@ export class Room {
   handleDraw(socketId: string, action: DrawAction): void {
     const player = this.players.get(socketId);
     if (!player?.isDrawing) return;
-    if (this.state !== 'drawing' && this.state !== 'speedDrawing' && this.state !== 'spyDrawing' && this.state !== 'allDrawing' && this.state !== 'chainDraw' && this.state !== 'revealDraw') return;
+    if (
+      this.state !== 'drawing' &&
+      this.state !== 'speedDrawing' &&
+      this.state !== 'spyDrawing' &&
+      this.state !== 'allDrawing' &&
+      this.state !== 'chainDraw' &&
+      this.state !== 'revealDraw'
+    ) return;
 
-    if (this.state === 'allDrawing' || this.state === 'chainDraw' || this.state === 'spyDrawing' || this.state === 'revealDraw') {
-      return; 
-    }
+    if (
+      this.state === 'allDrawing' ||
+      this.state === 'chainDraw' ||
+      this.state === 'spyDrawing' ||
+      this.state === 'revealDraw'
+    ) return;
 
     this.drawActions.push(action);
     this.io.to(this.id).except(socketId).emit('draw-action', action);
@@ -473,11 +396,21 @@ export class Room {
   handleDrawBatch(socketId: string, actions: DrawAction[]): void {
     const player = this.players.get(socketId);
     if (!player?.isDrawing) return;
-    if (this.state !== 'drawing' && this.state !== 'speedDrawing' && this.state !== 'spyDrawing' && this.state !== 'allDrawing' && this.state !== 'chainDraw' && this.state !== 'revealDraw') return;
+    if (
+      this.state !== 'drawing' &&
+      this.state !== 'speedDrawing' &&
+      this.state !== 'spyDrawing' &&
+      this.state !== 'allDrawing' &&
+      this.state !== 'chainDraw' &&
+      this.state !== 'revealDraw'
+    ) return;
 
-    if (this.state === 'allDrawing' || this.state === 'chainDraw' || this.state === 'spyDrawing' || this.state === 'revealDraw') {
-      return; 
-    }
+    if (
+      this.state === 'allDrawing' ||
+      this.state === 'chainDraw' ||
+      this.state === 'spyDrawing' ||
+      this.state === 'revealDraw'
+    ) return;
 
     this.drawActions.push(...actions);
     this.io.to(this.id).except(socketId).emit('draw-batch', actions);
@@ -494,7 +427,6 @@ export class Room {
 
     const result = checkGuess(text, this.currentWord);
 
-
     if (result === 'correct') {
       const isSpeedMode = this.state === 'speedDrawing';
       // Speed mode: only the first correct answer per word counts.
@@ -504,7 +436,6 @@ export class Room {
       player.guessedAt = Date.now();
       this.guessedCount++;
 
-      // Track guess order
       const elapsed = this.settings.drawTime - this.timeLeft;
       const guesserScore = isSpeedMode ? 1 : Math.max(50, 500 - elapsed * 5);
       const drawerBonus = isSpeedMode ? 1 : 50;
@@ -524,7 +455,6 @@ export class Room {
       );
       this.pendingDrawerScore += drawerBonus;
 
-      // Show correct message (without revealing the word text)
       this.addMessage(socketId, player.name, '', 'correct');
       if (isSpeedMode) {
         this.addSystemMessage(
@@ -540,20 +470,6 @@ export class Room {
       const allGuessed = activePlayers.every((p) => p.hasGuessed);
 
       if (isSpeedMode) {
-        // Speed mode: notify all players, then change word immediately.
-        this.io.to(this.id).emit('speed-word-guessed', {
-          word: this.currentWord,
-          guesserName: player.name,
-        });
-        this.speedNextWord();
-      } else if (allGuessed) {
-        this.endRound();
-      } else {
-        this.broadcastState();
-      }
-
-      if (isSpeedMode) {
-        // Speed mode: notify all players, then change word immediately.
         this.io.to(this.id).emit('speed-word-guessed', {
           word: this.currentWord,
           guesserName: player.name,
@@ -584,7 +500,6 @@ export class Room {
     this.clearTimers();
     this.state = 'roundEnd';
 
-    // Apply deferred scores NOW
     const scoreDeltas: Record<string, number> = {};
 
     this.pendingScores.forEach((score, playerId) => {
@@ -595,7 +510,6 @@ export class Room {
       }
     });
 
-    // Apply drawer bonus
     const drawerId = this.playerOrder[this.currentDrawerIndex];
     const drawer = this.players.get(drawerId);
     if (drawer && this.pendingDrawerScore > 0) {
@@ -628,17 +542,12 @@ export class Room {
           this.nextModeRound();
         }
       }
-    }, 8000); // 8 seconds between rounds (was 5)
+    }, 8000);
   }
 
   private endGame(): void {
     this.clearTimers();
     this.state = 'gameEnd';
-
-    const sortedPlayers = this.getPlayersArray().sort(
-      (a, b) => b.score - a.score
-    );
-
 
     const sortedPlayers = this.getPlayersArray().sort(
       (a, b) => b.score - a.score
@@ -652,18 +561,7 @@ export class Room {
       mode: this.settings.mode,
     });
 
-
-    this.io.to(this.id).emit('game-end', {
-      players: sortedPlayers,
-      winner: sortedPlayers[0],
-      mode: this.settings.mode,
-    });
-
     this.broadcastState();
-
-    setTimeout(() => {
-      this.resetToWaiting();
-    }, 10000);
 
     setTimeout(() => {
       this.resetToWaiting();
@@ -683,7 +581,6 @@ export class Room {
     this.currentDrawerIndex = -1;
     this.drawActions = [];
     this.currentWord = '';
-    this.currentCategory = '';
     this.currentCategory = '';
     this.hint = '';
     this.revealedIndices = [];
@@ -711,18 +608,10 @@ export class Room {
   // ─── Next mode round dispatcher ──────────────────────────
   private nextModeRound(): void {
     switch (this.settings.mode) {
-      case 'gallery':
-        this.startGalleryRound();
-        break;
-      case 'spy':
-        this.startSpyRound();
-        break;
-      case 'telephone':
-        this.startTelephoneRound();
-        break;
-      default:
-        this.nextTurn();
-        break;
+      case 'gallery':   this.startGalleryRound(); break;
+      case 'spy':       this.startSpyRound(); break;
+      case 'telephone': this.startTelephoneRound(); break;
+      default:          this.nextTurn(); break;
     }
   }
 
@@ -742,9 +631,8 @@ export class Room {
     this.guessOrder = [];
     this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
-    this.io.to(this.id).emit('clear-canvas'); // Force canvas reset for all players
+    this.io.to(this.id).emit('clear-canvas');
 
-    // Pick a word
     const words = getRandomWords(1, this.getWordPool());
     this.currentWord = words[0].word;
     this.currentCategory = words[0].category;
@@ -759,7 +647,6 @@ export class Room {
 
     this.addSystemMessage(`Раунд ${this.currentRound + 1}/${this.settings.rounds} — Все рисуют: ${this.currentWord}`);
 
-    // Send word to all players
     this.io.to(this.id).emit('gallery-draw-start', {
       word: this.currentWord,
       category: this.currentCategory,
@@ -785,38 +672,27 @@ export class Room {
     if (this.state !== 'allDrawing' && this.state !== 'spyDrawing') return;
     const player = this.players.get(socketId);
     if (!player || player.isEliminated || !player.isDrawing) return;
-    
-    // Check if player already submitted
+
     if (this.galleryReadyIds.includes(socketId)) return;
-    
-    // Add submission from this player
+
     this.galleryDrawings = this.galleryDrawings.filter(d => d.playerId !== socketId);
     this.galleryDrawings.push({
       playerId: socketId,
       playerName: player.name,
       dataUrl,
     });
-    
-    // Mark as ready
+
     this.galleryReadyIds.push(socketId);
     this.addSystemMessage(`${player.name} готов!`);
     this.broadcastState();
 
-    // Determine how many active drawing players
     const requiredPlayers = Array.from(this.players.values()).filter(p => !p.isEliminated && p.connected).length;
 
-    // If everyone submitted, proceed early
     if (this.galleryReadyIds.length >= requiredPlayers) {
       if (this.state === 'allDrawing') {
         this.endGalleryDrawing();
       } else if (this.state === 'spyDrawing') {
-        // Wait, startSpyVoting is implemented around line 850
         this.clearTimers();
-        // For spy we trigger startSpyVoting in logic when timeLeft runs out
-        // I need to clear timers properly and call it. But wait, startSpyVoting is private and declared later.
-        // Let's just set the timer to trigger immediately or call it.
-        // The safest way is to clear timers and rely on the fact that `startSpyVoting()` exists.
-        // Wait, startSpyVoting is defined below. I'll just call `this.startSpyVoting()`.
         this.startSpyVoting();
       }
     }
@@ -829,7 +705,6 @@ export class Room {
 
     this.players.forEach(p => { p.isDrawing = false; });
 
-    // Send gallery to all
     this.io.to(this.id).emit('gallery-vote-start', {
       drawings: this.galleryDrawings.map(d => ({
         playerId: d.playerId,
@@ -849,18 +724,16 @@ export class Room {
   handleGalleryVote(socketId: string, scores: Record<string, number>): void {
     if (this.state !== 'voting') return;
     if (!this.players.has(socketId)) return;
-    
-    // Validate we're not voting for ourselves
+
     const safeScores: Record<string, number> = {};
     Object.entries(scores).forEach(([targetId, score]) => {
       if (targetId !== socketId && this.players.has(targetId)) {
-        safeScores[targetId] = Math.max(0, Math.min(5, score)); // clamping between 0 and 5 stars
+        safeScores[targetId] = Math.max(0, Math.min(5, score));
       }
     });
 
     this.galleryScores.set(socketId, safeScores);
 
-    // End voting early if everyone submitted
     if (this.galleryScores.size >= this.players.size) {
       this.endGalleryVoting();
     }
@@ -869,16 +742,13 @@ export class Room {
   private endGalleryVoting(): void {
     this.clearTimers();
 
-    // Count score sums per target
     const targetSums: Record<string, number> = {};
-    
     this.galleryScores.forEach((scoresByVoter) => {
       Object.entries(scoresByVoter).forEach(([targetId, stars]) => {
         targetSums[targetId] = (targetSums[targetId] || 0) + stars;
       });
     });
 
-    // Score: each star = 20 points
     const scoreDeltas: Record<string, number> = {};
     for (const [playerId, totalStars] of Object.entries(targetSums)) {
       const player = this.players.get(playerId);
@@ -898,7 +768,7 @@ export class Room {
       scoreDeltas,
       guessOrder: [],
       mode: 'gallery',
-      voteCounts: targetSums, // Pass sum of stars to client for animation
+      voteCounts: targetSums,
     });
 
     this.broadcastState();
@@ -908,7 +778,7 @@ export class Room {
         this.currentRound++;
         this.startGalleryRound();
       }
-    }, 4000); // reduced timeout for Gallery Mode voting end
+    }, 4000);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -931,8 +801,8 @@ export class Room {
     this.drawActions = [];
     this.guessOrder = [];
     this.messages = [];
-    this.galleryDrawings = []; 
-    this.galleryReadyIds = []; 
+    this.galleryDrawings = [];
+    this.galleryReadyIds = [];
     this.io.to(this.id).emit('chat-cleared');
 
     // Select spies only once, at match start
@@ -963,7 +833,7 @@ export class Room {
     this.timeLeft = Math.min(this.settings.drawTime, 90);
 
     this.players.forEach((p) => {
-      p.isDrawing = !p.isEliminated; 
+      p.isDrawing = !p.isEliminated;
       p.hasGuessed = false;
     });
 
@@ -985,7 +855,7 @@ export class Room {
   private startSpyVoting(): void {
     this.clearTimers();
     this.state = 'spyVoting';
-    this.timeLeft = 30; 
+    this.timeLeft = 30;
     this.spyVotes = [];
 
     this.players.forEach(p => { p.isDrawing = false; });
@@ -998,7 +868,7 @@ export class Room {
 
     this.io.to(this.id).emit('spy-vote-start', {
       timeLeft: this.timeLeft,
-      drawings: this.galleryDrawings, 
+      drawings: this.galleryDrawings,
     });
 
     this.broadcastState();
@@ -1010,12 +880,12 @@ export class Room {
 
   handleSpyVote(socketId: string, suspectId: string): void {
     if (this.state !== 'spyVoting') return;
-    if (socketId === suspectId) return; 
+    if (socketId === suspectId) return;
     const voter = this.players.get(socketId);
-    if (!voter || voter.isEliminated) return; 
+    if (!voter || voter.isEliminated) return;
 
     const suspect = this.players.get(suspectId);
-    if (!suspect || suspect.isEliminated) return; 
+    if (!suspect || suspect.isEliminated) return;
 
     this.spyVotes = this.spyVotes.filter(v => v.voterId !== socketId);
     this.spyVotes.push({ voterId: socketId, suspectId });
@@ -1067,7 +937,7 @@ export class Room {
   private checkSpyWinCondition(lastEliminatedId: string, voteCounts: Record<string, number>): void {
     let activeSpies = 0;
     let activeInnocents = 0;
-    
+
     this.players.forEach(p => {
       if (!p.isEliminated && p.connected) {
         if (this.spyIds.includes(p.socketId)) activeSpies++;
@@ -1083,7 +953,7 @@ export class Room {
     } else {
       this.addSystemMessage(`Осталось ${activeSpies} шпионов и ${activeInnocents} мирных. Следующий раунд через 5 секунд.`);
       this.state = 'roundEnd';
-      
+
       this.io.to(this.id).emit('round-end', {
         mode: 'spy',
         word: this.currentWord,
@@ -1095,9 +965,9 @@ export class Room {
         voteCounts,
         isMatchEnd: false,
       });
-      
+
       this.broadcastState();
-      
+
       this.startTimer(() => {
         this.startSpyRound();
       }, 5000);
@@ -1172,7 +1042,6 @@ export class Room {
     this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
 
-    // Pick a word for the first player
     const words = getRandomWords(1, this.getWordPool());
     this.currentWord = words[0].word;
     this.currentCategory = words[0].category;
@@ -1180,7 +1049,6 @@ export class Room {
 
     this.addSystemMessage(`Раунд ${this.currentRound}/${this.settings.rounds} — Испорченный телефон!`);
 
-    // First player draws
     this.startTelephoneDrawStep();
   }
 
@@ -1204,7 +1072,6 @@ export class Room {
     this.state = 'chainDraw';
     this.timeLeft = Math.min(this.settings.drawTime, 45);
 
-    // Send word only to current drawer
     this.io.to(playerId).emit('telephone-draw', {
       word: this.chainCurrentWord,
       timeLeft: this.timeLeft,
@@ -1237,8 +1104,7 @@ export class Room {
     });
 
     this.chainCurrentIndex++;
-    
-    // Next player guesses
+
     if (this.chainCurrentIndex < this.playerOrder.length) {
       this.startTelephoneGuessStep();
     } else {
@@ -1259,7 +1125,6 @@ export class Room {
     this.state = 'chainGuess';
     this.timeLeft = 20;
 
-    // Send the last drawing to this player
     const lastDraw = this.telephoneChain[this.telephoneChain.length - 1];
     this.io.to(playerId).emit('telephone-guess', {
       dataUrl: lastDraw?.dataUrl || '',
@@ -1291,7 +1156,6 @@ export class Room {
     this.chainCurrentWord = text.trim();
     this.chainCurrentIndex++;
 
-    // Next player draws
     if (this.chainCurrentIndex < this.playerOrder.length) {
       this.startTelephoneDrawStep();
     } else {
@@ -1326,7 +1190,6 @@ export class Room {
 
     this.players.forEach(p => { p.isDrawing = false; });
 
-    // Give everyone participation points
     const scoreDeltas: Record<string, number> = {};
     this.players.forEach(p => {
       p.score += 50;
@@ -1349,7 +1212,7 @@ export class Room {
       if (this.state === 'roundEnd') {
         this.startTelephoneRound();
       }
-    }, 12000); // Longer pause for viewing chain
+    }, 12000);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -1390,13 +1253,12 @@ export class Room {
     }
 
     drawer.isDrawing = true;
-    
-    // Generate a queue of simple words
+
     this.speedWordQueue = getRandomWords(20, this.getWordPool());
     this.currentWord = this.speedWordQueue[0].word;
     this.currentCategory = this.speedWordQueue[0].category;
     this.speedWordQueue.shift();
-    
+
     this.state = 'speedDrawing';
     this.timeLeft = this.settings.drawTime;
     this.hint = '';
@@ -1406,7 +1268,6 @@ export class Room {
       `Быстрый раунд! ${drawer.name} рисует — ${this.settings.drawTime} сек!`
     );
 
-    // Send first word to drawer
     this.io.to(drawerId).emit('speed-word', {
       word: this.currentWord,
       category: this.currentCategory,
@@ -1425,7 +1286,6 @@ export class Room {
     this.drawActions = [];
     this.io.to(this.id).emit('canvas-cleared');
 
-    // Reset guesses
     this.players.forEach((p) => {
       if (!p.isDrawing) {
         p.hasGuessed = false;
@@ -1446,7 +1306,7 @@ export class Room {
     this.updateHint();
 
     const drawerId = this.playerOrder[this.currentDrawerIndex];
-    
+
     this.io.to(drawerId).emit('speed-word', {
       word: this.currentWord,
       category: this.currentCategory,
@@ -1481,20 +1341,17 @@ export class Room {
     const speedPlayerStats: Record<string, { wordsGuessed: number; playerName: string }> = {};
     this.guessOrder.forEach((entry) => {
       if (!speedPlayerStats[entry.playerId]) {
-        speedPlayerStats[entry.playerId] = {
-          wordsGuessed: 0,
-          playerName: entry.playerName,
-        };
+        speedPlayerStats[entry.playerId] = { wordsGuessed: 0, playerName: entry.playerName };
       }
       speedPlayerStats[entry.playerId].wordsGuessed++;
     });
 
     this.io.to(this.id).emit('round-end', {
-      word: this.currentWord, // last word attempted
+      word: this.currentWord,
       category: 'Быстрый раунд',
       players: this.getPlayersArray(),
       scoreDeltas,
-      guessOrder: [],          // not used in speed — replaced by speedPlayerStats
+      guessOrder: [],
       mode: 'speed',
       speedWordsGuessed: this.speedWordsGuessed,
       speedDrawerName: drawer?.name ?? '',
@@ -1527,7 +1384,6 @@ export class Room {
       return;
     }
 
-    // ── Reset state ──────────────────────────────────────────
     this.drawActions = [];
     this.revealedIndices = [];
     this.guessedCount = 0;
@@ -1546,7 +1402,6 @@ export class Room {
       p.guessedAt = 0;
     });
 
-    // Pick a word
     const words = getRandomWords(1, this.getWordPool());
     this.currentWord = words[0].word;
     this.currentCategory = words[0].category;
@@ -1555,7 +1410,6 @@ export class Room {
     const isSinglePlayer = this.players.size === 1;
 
     if (isSinglePlayer) {
-      // ── Single player: hint-only mode ─────────────────────
       this.addSystemMessage(
         `Раунд ${this.currentRound}/${this.settings.rounds} — Угадайте слово по буквенным подсказкам!`
       );
@@ -1573,7 +1427,6 @@ export class Room {
       this.startRevealInterval();
       this.startTimer(() => this.endRevealRound(), this.settings.drawTime);
     } else {
-      // ── Multiplayer: rotate drawer, drawing phase first ───
       this.currentDrawerIndex++;
       if (this.currentDrawerIndex >= this.playerOrder.length) {
         this.currentDrawerIndex = 0;
@@ -1597,7 +1450,6 @@ export class Room {
         `Раунд ${this.currentRound}/${this.settings.rounds} — ${drawer.name} рисует (скрыто). Угадайте что нарисовано!`
       );
 
-      // Send the secret word only to the drawer
       this.io.to(drawerId).emit('reveal-draw-start', {
         word: this.currentWord,
         category: this.currentCategory,
@@ -1609,7 +1461,6 @@ export class Room {
     }
   }
 
-  // Called when drawer submits or time runs out in revealDraw phase
   private startRevealingPhase(imageUrl: string): void {
     this.clearTimers();
     this.storedDrawing = imageUrl;
@@ -1631,7 +1482,6 @@ export class Room {
     this.startTimer(() => this.endRevealRound(), this.settings.drawTime);
   }
 
-  // Progressive reveal interval: runs every 3 s
   private startRevealInterval(): void {
     this.hintTimer = setInterval(() => {
       if (this.state !== 'revealing') {
@@ -1648,7 +1498,6 @@ export class Room {
     if (this.state !== 'revealing') return;
     const player = this.players.get(socketId);
     if (!player || player.hasGuessed) return;
-    // The drawer cannot guess their own drawing
     if (socketId === this.revealDrawerId) return;
 
     const result = checkGuess(text, this.currentWord);
@@ -1658,7 +1507,6 @@ export class Room {
       player.guessedAt = Date.now();
       this.guessedCount++;
 
-      // Score: earlier guess (less revealed) → more points
       const score = Math.max(50, Math.floor(500 * (1 - this.revealProgress / 100)));
 
       const orderEntry: GuessOrderEntry = {
@@ -1671,7 +1519,6 @@ export class Room {
       this.guessOrder.push(orderEntry);
       this.pendingScores.set(socketId, (this.pendingScores.get(socketId) || 0) + score);
 
-      // Drawer gets a bonus equal to the guesser's score
       if (this.revealDrawerId) {
         const drawer = this.players.get(this.revealDrawerId);
         if (drawer) {
@@ -1685,7 +1532,6 @@ export class Room {
       this.addMessage(socketId, player.name, '', 'correct');
       this.addSystemMessage(`${player.name} угадал слово!`);
 
-      // All non-drawer active players guessed → end early
       const guessers = Array.from(this.players.values()).filter(
         (p) => p.connected && p.socketId !== this.revealDrawerId,
       );
@@ -1755,15 +1601,9 @@ export class Room {
       this.updateHint();
       this.broadcastState();
     }
-    if (nextIdx !== null) {
-      this.revealedIndices.push(nextIdx);
-      this.updateHint();
-      this.broadcastState();
-    }
   }
 
   private startHintTimer(): void {
-    const hintInterval = 15;
     const hintInterval = 15;
     this.hintTimer = setInterval(() => {
       if (this.state !== 'drawing' && this.state !== 'speedDrawing') {
@@ -1772,10 +1612,7 @@ export class Room {
       }
       this.revealNextLetter();
     }, hintInterval * 1000);
-    }, hintInterval * 1000);
   }
-
-  // ─── Timers ───────────────────────────────────────────────────
 
   // ─── Timers ───────────────────────────────────────────────────
 
@@ -1783,15 +1620,9 @@ export class Room {
     this.clearTimers();
     this.timeLeft = seconds;
 
-
     this.roundTimer = setInterval(() => {
       this.timeLeft--;
       this.io.to(this.id).emit('timer-update', { timeLeft: this.timeLeft });
-
-      if (this.timeLeft <= 0) {
-        this.clearTimers();
-        callback();
-      }
 
       if (this.timeLeft <= 0) {
         this.clearTimers();
@@ -1809,34 +1640,10 @@ export class Room {
       clearInterval(this.hintTimer);
       this.hintTimer = null;
     }
-    if (this.roundTimer) {
-      clearInterval(this.roundTimer);
-      this.roundTimer = null;
-    }
-    if (this.hintTimer) {
-      clearInterval(this.hintTimer);
-      this.hintTimer = null;
-    }
   }
 
   // ─── Messages ─────────────────────────────────────────────────
 
-  // ─── Messages ─────────────────────────────────────────────────
-
-  private addMessage(
-    playerId: string,
-    playerName: string,
-    text: string,
-    type: ChatMessage['type']
-  ): void {
-    const msg: ChatMessage = {
-      id: `msg-${++this.msgCounter}`,
-      playerId,
-      playerName,
-      text,
-      type,
-      timestamp: Date.now(),
-    };
   private addMessage(
     playerId: string,
     playerName: string,
@@ -1855,9 +1662,6 @@ export class Room {
     if (this.messages.length > 100) {
       this.messages = this.messages.slice(-100);
     }
-    if (this.messages.length > 100) {
-      this.messages = this.messages.slice(-100);
-    }
     this.io.to(this.id).emit('chat-message', msg);
   }
 
@@ -1866,15 +1670,7 @@ export class Room {
   }
 
   // ─── State Broadcasting ───────────────────────────────────────
-  addSystemMessage(text: string): void {
-    this.addMessage('system', 'Система', text, 'system');
-  }
 
-  // ─── State Broadcasting ───────────────────────────────────────
-
-  getPlayersArray(): Player[] {
-    return Array.from(this.players.values());
-  }
   getPlayersArray(): Player[] {
     return Array.from(this.players.values());
   }
@@ -1882,7 +1678,7 @@ export class Room {
   getPublicState() {
     let drawerId = this.playerOrder[this.currentDrawerIndex];
     if (this.state === 'allDrawing' || this.state === 'voting') {
-      drawerId = 'all'; // Special marker for gallery mode where everyone draws
+      drawerId = 'all';
     } else if (this.state === 'spyDrawing') {
       drawerId = 'all';
     } else if (this.state === 'chainDraw' || this.state === 'chainGuess') {
@@ -1890,7 +1686,7 @@ export class Room {
     } else if (this.state === 'revealDraw') {
       drawerId = this.revealDrawerId;
     }
-    
+
     return {
       id: this.id,
       state: this.state,
@@ -1925,20 +1721,18 @@ export class Room {
     const publicState = this.getPublicState();
     const drawerId = this.playerOrder[this.currentDrawerIndex];
 
-
     this.players.forEach((player) => {
       const isCurrentDrawer = player.socketId === drawerId;
       const showWord = isCurrentDrawer && (
-        this.state === 'drawing' || 
-        this.state === 'speedDrawing' || 
+        this.state === 'drawing' ||
+        this.state === 'speedDrawing' ||
         this.state === 'allDrawing' ||
         this.state === 'revealDraw'
       );
-      
+
       if (showWord) {
         this.io.to(player.socketId).emit('game-state', this.getDrawerState());
       } else if (this.state === 'allDrawing') {
-        // Gallery mode: all players see the word
         this.io.to(player.socketId).emit('game-state', {
           ...publicState,
           currentWord: this.currentWord,
@@ -1949,17 +1743,6 @@ export class Room {
     });
   }
 
-  get isEmpty(): boolean {
-    return this.players.size === 0;
-  }
-
-  get playerCount(): number {
-    return this.players.size;
-  }
-
-  getHost(): Player | undefined {
-    return Array.from(this.players.values()).find((p) => p.isHost);
-  }
   get isEmpty(): boolean {
     return this.players.size === 0;
   }
@@ -1988,16 +1771,6 @@ export class Room {
     this.broadcastState();
   }
 
-  destroy(): void {
-    this.clearTimers();
-    this.players.clear();
-    this.messages = [];
-    this.drawActions = [];
-    this.pendingScores.clear();
-    this.galleryDrawings = [];
-    this.galleryScores.clear();
-    this.telephoneChain = [];
-  }
   destroy(): void {
     this.clearTimers();
     this.players.clear();
