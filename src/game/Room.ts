@@ -23,6 +23,7 @@ export type RoomState =
   | 'gallery'
   | 'voting'
   // Spy mode states
+  | 'spyPrep'
   | 'spyDrawing'
   | 'spyVoting'
   | 'spyGuess'
@@ -38,11 +39,13 @@ export type RoomState =
 export interface RoomSettings {
   maxPlayers: number;
   rounds: number;
+  spyRounds?: number;
   drawTime: number;
   chooseTime: number;
   mode: GameMode;
   wordBankIds: string[];
   spyCount?: number;
+  spyTurnTime?: number;
 }
 
 export interface DrawAction {
@@ -96,11 +99,13 @@ export interface TelephoneChainLink {
 const DEFAULT_SETTINGS: RoomSettings = {
   maxPlayers: 10,
   rounds: 3,
+  spyRounds: 2,
   drawTime: 90,
   chooseTime: 15,
   mode: 'classic',
   wordBankIds: ['all'],
   spyCount: 1,
+  spyTurnTime: 5,
 };
 
 export class Room {
@@ -214,6 +219,11 @@ export class Room {
     }
 
     if (player.isDrawing && this.state === 'spyDrawing') {
+      this.clearTimers();
+      this.startNextSpyTurn();
+      return;
+    }
+    if (this.state === 'spyPrep' && this.spyCurrentDrawerId === socketId) {
       this.clearTimers();
       this.startNextSpyTurn();
       return;
@@ -798,8 +808,8 @@ export class Room {
     this.messages = [];
     this.io.to(this.id).emit('chat-cleared');
 
-    // Match initialization: one word for all circles.
-    if (this.currentRound === 0) {
+    // Select spies once per match, then keep teams until game end.
+    if (this.spyIds.length === 0) {
       const desiredSpyCount = this.settings.spyCount || 1;
       const actualSpyCount = Math.min(desiredSpyCount, Math.max(1, activePlayers.length - 2));
 
@@ -810,18 +820,35 @@ export class Room {
         const randIdx = Math.floor(Math.random() * eligibleIds.length);
         this.spyIds.push(eligibleIds.splice(randIdx, 1)[0]);
       }
-
-      const words = getRandomWords(1, this.getWordPool());
-      this.currentWord = words[0].word;
-      this.currentCategory = words[0].category;
     }
 
+    // New word every phase (after each voting).
+    const words = getRandomWords(1, this.getWordPool());
+    this.currentWord = words[0].word;
+    this.currentCategory = words[0].category;
+
     this.currentRound = 1;
+    const spyTurnTime = this.getSpyTurnTime();
+    const spyRounds = this.getSpyRounds();
     this.addSystemMessage(
-      `Шпион-режим: ${this.settings.rounds} круг(а), ${this.settings.drawTime} сек. на ход. Затем голосование.`
+      `Шпион-режим: ${spyRounds} круг(а), ${spyTurnTime} сек. на ход. Затем голосование.`
     );
+    // Shared canvas persists across all turns in this phase and resets only now.
+    this.io.to(this.id).emit('clear-canvas');
     this.emitSpyRoles();
     this.startNextSpyTurn();
+  }
+
+  private getSpyTurnTime(): number {
+    const raw = Number(this.settings.spyTurnTime ?? this.settings.drawTime);
+    if (!Number.isFinite(raw)) return 5;
+    return Math.max(3, Math.min(Math.round(raw), 120));
+  }
+
+  private getSpyRounds(): number {
+    const raw = Number(this.settings.spyRounds ?? this.settings.rounds);
+    if (!Number.isFinite(raw)) return 2;
+    return Math.max(1, Math.min(Math.round(raw), 12));
   }
 
   private emitSpyRoles(): void {
@@ -859,13 +886,13 @@ export class Room {
 
     this.spyTurnIndex++;
     if (this.spyTurnIndex >= activeIds.length) {
-      if (this.currentRound >= this.settings.rounds) {
+      if (this.currentRound >= this.getSpyRounds()) {
         this.startSpyVoting();
         return;
       }
       this.currentRound++;
       this.spyTurnIndex = 0;
-      this.addSystemMessage(`Круг ${this.currentRound}/${this.settings.rounds}`);
+      this.addSystemMessage(`Круг ${this.currentRound}/${this.getSpyRounds()}`);
     }
 
     const drawerId = activeIds[this.spyTurnIndex];
@@ -876,17 +903,44 @@ export class Room {
     }
 
     this.spyCurrentDrawerId = drawerId;
+    this.startSpyPrep(drawer);
+  }
+
+  private startSpyPrep(drawer: Player): void {
+    this.clearTimers();
+    this.state = 'spyPrep';
+    this.timeLeft = 3;
+
+    this.players.forEach((p) => {
+      p.isDrawing = false;
+      p.hasGuessed = false;
+    });
+
+    this.addSystemMessage(`Приготовиться: сейчас рисует ${drawer.name}`);
+    this.broadcastState();
+
+    this.startTimer(() => {
+      this.startSpyDrawingTurn(drawer.socketId);
+    }, this.timeLeft);
+  }
+
+  private startSpyDrawingTurn(drawerId: string): void {
+    const drawer = this.players.get(drawerId);
+    if (!drawer || drawer.isEliminated || !drawer.connected) {
+      this.startNextSpyTurn();
+      return;
+    }
+
+    this.spyCurrentDrawerId = drawerId;
     this.state = 'spyDrawing';
-    this.timeLeft = Math.max(3, Math.min(this.settings.drawTime, 120));
-    this.drawActions = [];
+    this.timeLeft = this.getSpyTurnTime();
 
     this.players.forEach((p) => {
       p.isDrawing = p.socketId === drawerId;
       p.hasGuessed = false;
     });
 
-    this.io.to(this.id).emit('clear-canvas');
-    this.addSystemMessage(`Ход ${drawer.name} (${this.currentRound}/${this.settings.rounds})`);
+    this.addSystemMessage(`Ход ${drawer.name} (${this.currentRound}/${this.getSpyRounds()})`);
     this.broadcastState();
 
     this.startTimer(() => {
@@ -1012,10 +1066,8 @@ export class Room {
       this.broadcastState();
 
       this.startTimer(() => {
-        this.spyTurnIndex = -1;
-        this.spyCurrentDrawerId = '';
-        this.currentRound = 1;
-        this.startNextSpyTurn();
+        // After voting start a new phase: clear canvas and issue a new word.
+        this.startSpyRound();
       }, 5000);
     }
   }
@@ -1698,7 +1750,7 @@ export class Room {
     let drawerId = this.playerOrder[this.currentDrawerIndex];
     if (this.state === 'allDrawing' || this.state === 'voting') {
       drawerId = 'all';
-    } else if (this.state === 'spyDrawing') {
+    } else if (this.state === 'spyDrawing' || this.state === 'spyPrep') {
       drawerId = this.spyCurrentDrawerId;
     } else if (this.state === 'chainDraw' || this.state === 'chainGuess') {
       drawerId = this.playerOrder[this.chainCurrentIndex];
@@ -1710,7 +1762,7 @@ export class Room {
       mode: this.settings.mode,
       players: this.getPlayersArray(),
       currentRound: this.currentRound,
-      totalRounds: this.settings.rounds,
+      totalRounds: this.settings.mode === 'spy' ? this.getSpyRounds() : this.settings.rounds,
       drawerId,
       hint: this.hint,
       currentCategory: this.currentCategory,
@@ -1784,6 +1836,12 @@ export class Room {
         1,
         Math.min(nextSettings.spyCount, Math.max(1, nextSettings.maxPlayers - 2))
       );
+    }
+    if (nextSettings.spyTurnTime !== undefined) {
+      nextSettings.spyTurnTime = Math.max(3, Math.min(nextSettings.spyTurnTime, 120));
+    }
+    if (nextSettings.spyRounds !== undefined) {
+      nextSettings.spyRounds = Math.max(1, Math.min(nextSettings.spyRounds, 12));
     }
     this.settings = nextSettings;
     this.broadcastState();
